@@ -1,1 +1,10 @@
-# organizador_academico_nosql
+# TRABALHO PRÁTICO NOSQL
+## Alunos: João Pedro Reis e Luiz Alexandre Freitas 
+
+Tema: Organizador acadêmico colaborativo
+
+Principal funcionalidade: Permitir que os usuários compartilhem e acessem fotos de conteúdos acadêmcos apresentados em aula, organizados por disciplina, semestre e professor.
+
+Cliente: Estudantes universitários
+
+Entrega de valor: O sistema irá oferecer aos estudantes um acervo colaborativo de fotos de conteúdos de aula, organizado por disciplina, semestre e professor, permitindo acesso rápido às anotações e facilitando o estudo e a troca de informações
