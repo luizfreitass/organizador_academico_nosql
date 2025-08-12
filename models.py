@@ -2,7 +2,7 @@ from pydantic import BaseModel, Field, EmailStr
 from datetime import datetime
 from typing import Optional
 
-# ----- MODELOS ENTRADA/SAÍDA ----------
+# ----- MODELOS ENTRADA ----------
 class UsuarioIn(BaseModel):
     nome: str
     email: EmailStr
