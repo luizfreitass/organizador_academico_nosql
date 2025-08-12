@@ -14,10 +14,28 @@ fotos        = db["fotos"]
 
 def create_indexes():
     """
-    Cria (ou garante) índices para consultas rápidas.
-    Chamado pelo evento 'startup' do FastAPI.
+    Índices usados pelas buscas e relatórios.
+    Chamado no evento 'startup' do FastAPI.
     """
-    fotos.create_index([("disciplina_id", ASCENDING)])
+    # ---- FOTOS ----
+    # Busca por disciplina + ordenação por data (rota /fotos/search e analytics)
+    fotos.create_index([("disciplina_id", ASCENDING), ("data_upload", DESCENDING)])
+
+    # Top contribuidores e filtros por usuário + data (analytics)
+    fotos.create_index([("usuario_id", ASCENDING), ("data_upload", DESCENDING)])
+
+    # Filtros adicionais usados em relatórios
     fotos.create_index([("professor_id", ASCENDING)])
     fotos.create_index([("semestre", ASCENDING)])
-    fotos.create_index([("data_upload", DESCENDING)])  # para ordenação recente
+
+    # ---- USUÁRIOS ---- (boa prática)
+    usuarios.create_index([("email", ASCENDING)], unique=True)
+
+    # ---- DISCIPLINAS ---- (listagens/relatórios)
+    disciplinas.create_index([("nome", ASCENDING)])
+    disciplinas.create_index([("semestre", ASCENDING)])
+
+    # ---- PROFESSORES ---- (busca por nome)
+    professores.create_index([("nome", ASCENDING)])
+
+    print("Índices criados/garantidos com sucesso!")
