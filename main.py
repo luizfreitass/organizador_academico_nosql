@@ -3,6 +3,28 @@ from typing import List, Optional
 from datetime import datetime
 from bson import ObjectId
 
+import os, json
+import redis
+from dotenv import load_dotenv
+
+load_dotenv()
+
+r = redis.Redis.from_url(os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0"),
+                         decode_responses=True)
+CACHE_TTL = int(os.getenv("CACHE_TTL_SECONDS", "300"))
+
+def cache_get_json(key: str):
+    v = r.get(key)
+    return json.loads(v) if v else None
+
+def cache_set_json(key: str, value, ttl: int = CACHE_TTL):
+    # default=str resolve datetime para string ISO
+    r.set(key, json.dumps(value, default=str), ex=ttl)
+
+def cache_invalidate_prefix(prefix: str):
+    for k in r.scan_iter(match=f"{prefix}*"):
+        r.delete(k)
+
 from database import usuarios, professores, disciplinas, fotos, create_indexes
 from models import (
     UsuarioIn, ProfessorIn, DisciplinaIn, FotoIn,
@@ -98,6 +120,10 @@ def update_disciplina(disciplina_id: str, dados: DisciplinaIn):
 def upload_foto(foto: FotoIn):
     res = fotos.insert_one(foto.dict())
     doc = fotos.find_one({"_id": res.inserted_id})
+    # invalida caches que dependem de fotos
+    cache_invalidate_prefix("fotos:search:")
+    cache_invalidate_prefix("analytics:fpd:")   # fotos-por-disciplina
+    cache_invalidate_prefix("analytics:top:")   # top-contribuidores
     return to_dict(doc)
 
 # ---- BUSCA (usa índices) - manter ANTES de /fotos/{foto_id} ----
@@ -109,13 +135,21 @@ def search_fotos(
     skip: int = 0,
     limit: int = 20,
 ):
-    filtro = {"disciplina_id": disciplina_id}
     sort_flag = -1 if direction == "desc" else 1
-    cursor = (fotos.find(filtro)
-                    .sort(order_by, sort_flag)
-                    .skip(skip)
-                    .limit(limit))
-    return [to_dict(f) for f in cursor]
+    cache_key = f"fotos:search:disc={disciplina_id}|ob={order_by}|dir={direction}|sk={skip}|lim={limit}"
+
+    cached = cache_get_json(cache_key)
+    if cached is not None:
+        return cached
+
+    cursor = (fotos.find({"disciplina_id": disciplina_id})
+                  .sort(order_by, sort_flag)
+                  .skip(skip)
+                  .limit(limit))
+    result = [to_dict(f) for f in cursor]
+
+    cache_set_json(cache_key, result)
+    return result
 
 @app.get("/fotos/{foto_id}", response_model=FotoOut)
 def get_foto(foto_id: str):
@@ -133,117 +167,100 @@ def update_foto(foto_id: str, dados: FotoIn):
     )
     if not atualizado:
         raise HTTPException(status_code=404, detail="Foto não encontrada")
+    cache_invalidate_prefix("fotos:search:")
+    cache_invalidate_prefix("analytics:fpd:")
+    cache_invalidate_prefix("analytics:top:")
     return to_dict(atualizado)
 
 @app.delete("/fotos/{foto_id}")
 def delete_foto(foto_id: str):
     if fotos.delete_one({"_id": ObjectId(foto_id)}).deleted_count == 0:
         raise HTTPException(status_code=404, detail="Foto não encontrada")
+    cache_invalidate_prefix("fotos:search:")
+    cache_invalidate_prefix("analytics:fpd:")
+    cache_invalidate_prefix("analytics:top:")
     return {"ok": True}
 
 # ---------- ANALYTICS: MULTI-STAGE AGG PIPELINES ----------
 
 # 1) Fotos por disciplina (group + lookups + project + paginação)
-@app.get("/analytics/fotos-por-disciplina", response_model=List[dict])
+@app.get("/analytics/fotos-por-disciplina")
 def fotos_por_disciplina(
-    semestre: Optional[str] = Query(None, description="Ex: 1º, 2º, 3º..."),
-    start: Optional[str] = Query(None, description="ISO inicial, ex: 2025-07-01T00:00:00Z"),
-    end: Optional[str] = Query(None, description="ISO final, ex: 2025-08-31T23:59:59Z"),
+    semestre: Optional[str] = None,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
     limit: int = 10,
     skip: int = 0,
 ):
-    match: dict = {}
-    if semestre:
-        match["semestre"] = semestre
+    cache_key = f"analytics:fpd:sem={semestre}|st={start}|en={end}|lim={limit}|sk={skip}"
+    cached = cache_get_json(cache_key)
+    if cached is not None:
+        # 🚩 indica que a resposta veio do cache
+        return {"from_cache": True, "data": cached}
 
-    di = _parse_iso(start)
-    df = _parse_iso(end)
-    if di or df:
-        match["data_upload"] = {}
-        if di: match["data_upload"]["$gte"] = di
-        if df: match["data_upload"]["$lte"] = df
+    # monta filtro
+    match_stage = {}
+    if semestre:
+        match_stage["semestre"] = semestre
+    if start or end:
+        match_stage["data_upload"] = {}
+        if start:
+            match_stage["data_upload"]["$gte"] = datetime.fromisoformat(start.replace("Z",""))
+        if end:
+            match_stage["data_upload"]["$lte"] = datetime.fromisoformat(end.replace("Z",""))
 
     pipeline = [
-        {"$match": match if match else {}},
+        {"$match": match_stage} if match_stage else {"$match": {}},
         {"$group": {
-            "_id": {"disciplina_id": "$disciplina_id"},
+            "_id": {"disciplina_id": "$disciplina_id", "professor_id": "$professor_id", "semestre": "$semestre"},
             "total_fotos": {"$sum": 1},
             "ultimo_upload": {"$max": "$data_upload"}
         }},
         {"$sort": {"total_fotos": -1}},
-        {"$lookup": {
-            "from": "disciplinas",
-            "localField": "_id.disciplina_id",
-            "foreignField": "_id",
-            "as": "disc"
-        }},
+        {"$skip": skip},
+        {"$limit": limit},
+        {"$lookup": {"from": "disciplinas", "localField": "_id.disciplina_id", "foreignField": "_id", "as": "disc"}},
         {"$unwind": "$disc"},
-        {"$lookup": {
-            "from": "professores",
-            "localField": "disc.professor_id",
-            "foreignField": "_id",
-            "as": "prof"
-        }},
+        {"$lookup": {"from": "professores", "localField": "_id.professor_id", "foreignField": "_id", "as": "prof"}},
         {"$unwind": "$prof"},
         {"$project": {
             "_id": 0,
             "disciplina_id": "$_id.disciplina_id",
             "disciplina": "$disc.nome",
-            "semestre": "$disc.semestre",
-            "professor_id": "$prof._id",
+            "semestre": "$_id.semestre",
+            "professor_id": "$_id.professor_id",
             "professor": "$prof.nome",
             "total_fotos": 1,
             "ultimo_upload": 1
-        }},
-        {"$skip": skip},
-        {"$limit": limit},
+        }}
     ]
-    return list(fotos.aggregate(pipeline))
 
-# 2) Top contribuidores (group por usuário + lookup + project + paginação)
-@app.get("/analytics/top-contribuidores", response_model=List[dict])
-def top_contribuidores(
-    disciplina_id: Optional[str] = Query(None, description="Filtra por disciplina (ex: d001)"),
-    start: Optional[str] = Query(None, description="ISO inicial"),
-    end: Optional[str] = Query(None, description="ISO final"),
-    limit: int = 10,
-    skip: int = 0,
-):
-    match: dict = {}
-    if disciplina_id:
-        match["disciplina_id"] = disciplina_id
+    result = list(fotos.aggregate(pipeline))
+    cache_set_json(cache_key, result, ttl=60)  # TTL de 60s
+    return {"from_cache": False, "data": result}
 
-    di = _parse_iso(start)
-    df = _parse_iso(end)
-    if di or df:
-        match["data_upload"] = {}
-        if di: match["data_upload"]["$gte"] = di
-        if df: match["data_upload"]["$lte"] = df
+
+@app.get("/analytics/top-contribuidores")
+def top_contribuidores(limit: int = 5):
+    cache_key = f"analytics:tc:lim={limit}"
+    cached = cache_get_json(cache_key)
+    if cached is not None:
+        return {"from_cache": True, "data": cached}
 
     pipeline = [
-        {"$match": match if match else {}},
-        {"$group": {
-            "_id": {"usuario_id": "$usuario_id"},
-            "total_fotos": {"$sum": 1},
-            "ultimo_upload": {"$max": "$data_upload"}
-        }},
-        {"$sort": {"total_fotos": -1, "ultimo_upload": -1}},
-        {"$lookup": {
-            "from": "usuarios",
-            "localField": "_id.usuario_id",
-            "foreignField": "_id",
-            "as": "user"
-        }},
-        {"$unwind": "$user"},
+        {"$group": {"_id": "$usuario_id", "total_fotos": {"$sum": 1}}},
+        {"$sort": {"total_fotos": -1}},
+        {"$limit": limit},
+        {"$lookup": {"from": "usuarios", "localField": "_id", "foreignField": "_id", "as": "usr"}},
+        {"$unwind": "$usr"},
         {"$project": {
             "_id": 0,
-            "usuario_id": "$_id.usuario_id",
-            "usuario_nome": "$user.nome",
-            "usuario_email": "$user.email",
-            "total_fotos": 1,
-            "ultimo_upload": 1
-        }},
-        {"$skip": skip},
-        {"$limit": limit},
+            "usuario_id": "$_id",
+            "usuario": "$usr.nome",
+            "total_fotos": 1
+        }}
     ]
-    return list(fotos.aggregate(pipeline))
+
+    result = list(fotos.aggregate(pipeline))
+    cache_set_json(cache_key, result, ttl=60)
+    return {"from_cache": False, "data": result}
