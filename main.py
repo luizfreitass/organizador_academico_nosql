@@ -5,26 +5,53 @@ from bson import ObjectId
 
 import os, json
 import redis
+from redis.exceptions import RedisError
 from dotenv import load_dotenv
 
 load_dotenv()
 
+# ---------- REDIS CLIENT ----------
 r = redis.Redis.from_url(os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0"),
                          decode_responses=True)
 CACHE_TTL = int(os.getenv("CACHE_TTL_SECONDS", "300"))
 
 def cache_get_json(key: str):
-    v = r.get(key)
-    return json.loads(v) if v else None
+    try:
+        v = r.get(key)
+        return json.loads(v) if v else None
+    except RedisError:
+        return None
 
 def cache_set_json(key: str, value, ttl: int = CACHE_TTL):
-    # default=str resolve datetime para string ISO
-    r.set(key, json.dumps(value, default=str), ex=ttl)
+    try:
+        r.set(key, json.dumps(value, default=str), ex=ttl)
+    except RedisError:
+        pass
 
 def cache_invalidate_prefix(prefix: str):
-    for k in r.scan_iter(match=f"{prefix}*"):
-        r.delete(k)
+    try:
+        for k in r.scan_iter(match=f"{prefix}*"):
+            r.delete(k)
+    except RedisError:
+        pass
 
+# ---------- HYPERLOGLOG ----------
+def hll_add_contrib(disciplina_id: str, usuario_id: str):
+    try:
+        r.pfadd(f"hll:disc:{disciplina_id}", usuario_id)  # por disciplina
+        r.pfadd("hll:global", usuario_id)                 # global
+    except RedisError:
+        pass
+
+def hll_count_contrib(disciplina_id: Optional[str] = None) -> Optional[int]:
+    try:
+        if disciplina_id:
+            return r.pfcount(f"hll:disc:{disciplina_id}")
+        return r.pfcount("hll:global")
+    except RedisError:
+        return None
+
+# ---------- IMPORTS DO PROJETO ----------
 from database import usuarios, professores, disciplinas, fotos, create_indexes
 from models import (
     UsuarioIn, ProfessorIn, DisciplinaIn, FotoIn,
@@ -43,7 +70,6 @@ def startup_event():
 def _parse_iso(dt: Optional[str]) -> Optional[datetime]:
     if not dt:
         return None
-    # aceita final 'Z'
     return datetime.fromisoformat(dt.replace("Z", "+00:00"))
 
 # ---------- USUÁRIOS ----------
@@ -93,7 +119,6 @@ def update_professor(professor_id: str, dados: ProfessorIn):
 # ---------- DISCIPLINAS ----------
 @app.post("/disciplinas", response_model=DisciplinaOut)
 def create_disciplina(disc: DisciplinaIn):
-    # opcional: checar existência do professor
     if not professores.find_one({"_id": disc.professor_id}):
         raise HTTPException(status_code=404, detail="Professor não encontrado")
     res = disciplinas.insert_one(disc.dict())
@@ -120,13 +145,17 @@ def update_disciplina(disciplina_id: str, dados: DisciplinaIn):
 def upload_foto(foto: FotoIn):
     res = fotos.insert_one(foto.dict())
     doc = fotos.find_one({"_id": res.inserted_id})
-    # invalida caches que dependem de fotos
+
+    # Atualiza HyperLogLog (usuários únicos por disciplina e global)
+    hll_add_contrib(doc["disciplina_id"], doc["usuario_id"])
+
+    # Invalida caches derivados
     cache_invalidate_prefix("fotos:search:")
-    cache_invalidate_prefix("analytics:fpd:")   # fotos-por-disciplina
-    cache_invalidate_prefix("analytics:top:")   # top-contribuidores
+    cache_invalidate_prefix("analytics:fpd:")
+    cache_invalidate_prefix("analytics:top:")
+
     return to_dict(doc)
 
-# ---- BUSCA (usa índices) - manter ANTES de /fotos/{foto_id} ----
 @app.get("/fotos/search", response_model=List[FotoOut])
 def search_fotos(
     disciplina_id: str = Query(..., description="ID da disciplina (obrigatório)"),
@@ -181,9 +210,7 @@ def delete_foto(foto_id: str):
     cache_invalidate_prefix("analytics:top:")
     return {"ok": True}
 
-# ---------- ANALYTICS: MULTI-STAGE AGG PIPELINES ----------
-
-# 1) Fotos por disciplina (group + lookups + project + paginação)
+# ---------- ANALYTICS ----------
 @app.get("/analytics/fotos-por-disciplina")
 def fotos_por_disciplina(
     semestre: Optional[str] = None,
@@ -195,10 +222,8 @@ def fotos_por_disciplina(
     cache_key = f"analytics:fpd:sem={semestre}|st={start}|en={end}|lim={limit}|sk={skip}"
     cached = cache_get_json(cache_key)
     if cached is not None:
-        # 🚩 indica que a resposta veio do cache
         return {"from_cache": True, "data": cached}
 
-    # monta filtro
     match_stage = {}
     if semestre:
         match_stage["semestre"] = semestre
@@ -236,9 +261,8 @@ def fotos_por_disciplina(
     ]
 
     result = list(fotos.aggregate(pipeline))
-    cache_set_json(cache_key, result, ttl=60)  # TTL de 60s
+    cache_set_json(cache_key, result, ttl=60)
     return {"from_cache": False, "data": result}
-
 
 @app.get("/analytics/top-contribuidores")
 def top_contribuidores(limit: int = 5):
@@ -264,3 +288,18 @@ def top_contribuidores(limit: int = 5):
     result = list(fotos.aggregate(pipeline))
     cache_set_json(cache_key, result, ttl=60)
     return {"from_cache": False, "data": result}
+
+# ---------- ANALYTICS: HLL ----------
+@app.get("/analytics/unique-contribuidores")
+def unique_contribuidores(disciplina_id: Optional[str] = None):
+    """
+    Conta aproximada de usuários únicos que enviaram fotos.
+    - Se 'disciplina_id' for passado: retorna para aquela disciplina
+    - Se não: retorna global
+    """
+    total = hll_count_contrib(disciplina_id)
+    return {
+        "estrutura": "HyperLogLog",
+        "escopo": disciplina_id or "global",
+        "qtd_usuarios_unicos": total,
+    }
